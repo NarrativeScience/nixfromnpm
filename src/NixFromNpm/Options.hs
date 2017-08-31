@@ -11,6 +11,8 @@ import qualified Data.HashMap.Strict as H
 
 import Options.Applicative
 
+import NixFromNpm.NpmTypes (VersionInfo, PackageJsonError(..),
+                            packageJsonToVersionInfo)
 import NixFromNpm.NpmVersion
 import NixFromNpm.Parsers.NpmVersion
 import NixFromNpm.SemVer
@@ -34,6 +36,7 @@ data InvalidOption
   = NpmVersionError NpmVersionError
   | InvalidNodeLib FilePath InvalidNodeLib
   | InvalidExtensionSyntax Text
+  | InvalidPackageJson PackageJsonError
   | DuplicatedExtensionName Name FilePath FilePath
   | InvalidURI Text
   deriving (Show, Eq, Typeable)
@@ -63,7 +66,8 @@ data RawOptions = RawOptions {
 data NixFromNpmOptions = NixFromNpmOptions {
   nfnoPkgNames :: [(Name, NpmVersionRange)],
   -- ^ Names/versions of packages to build.
-  nfnoPkgPaths :: [FilePath],    -- ^ Path of package.json to build.
+  nfnoPkgPaths :: [(FilePath, VersionInfo)],
+  -- ^ Paths and parsed VersionInfos of package.json files to build.
   nfnoOutputPath :: FilePath,    -- ^ Path to output built expressions to.
   nfnoNoDefaultNix :: Bool,      -- ^ Disable creation of default.nix file.
   nfnoCacheDepth :: Int,         -- ^ Dependency depth at which to use cache.
@@ -94,7 +98,7 @@ validateExtension path = do
   assert' (doesFileExist (path </> "default.nix")) NoDefaultNix
   assert' (doesFileExist (path </> ".nixfromnpm-version")) NoVersionFile
   assert' (doesDirectoryExist (path </> nodePackagesDir)) NoPackageDir
-  return path
+  map (</> path) getCurrentDirectory
 
 -- | Validate an output folder. An output folder EITHER must not exist, but
 -- its parent directory does and is writable, OR it does exist, is writable,
@@ -104,7 +108,6 @@ validateOutput path = do
   let assert' test err = assert test (InvalidNodeLib path err)
   doesDirectoryExist path >>= \case
     True -> do assert' (isWritable path) OutputNotWritable
-               putStrLn "hey"
                validateExtension path
     False -> do
       let parentPath = parent path
@@ -112,7 +115,15 @@ validateOutput path = do
               OutputParentPathDoesn'tExist
       assert' (isWritable $ parentPath)
               OutputParentNotWritable
-      return path
+      map (</> path) getCurrentDirectory
+
+validatePackageJson :: FilePath -> IO (FilePath, VersionInfo)
+validatePackageJson path = do
+  let pkJsonPath = path </> "package.json"
+  assert (doesDirectoryExist path) (DirectoryDoesn'tExist path)
+  assert (doesFileExist pkJsonPath) (NoPackageJson pkJsonPath)
+  versionInfo <- packageJsonToVersionInfo pkJsonPath
+  return (path, versionInfo)
 
 validateOptions :: RawOptions -> IO NixFromNpmOptions
 validateOptions opts = do
@@ -127,7 +138,7 @@ validateOptions opts = do
           True -> return p'
   packageNames <- mapM parseNameAndRange $ roPkgNames opts
   extendPaths <- getExtensions (roExtendPaths opts)
-  packagePaths <- mapM (validatePath . fromText) $ roPkgPaths opts
+  packagePaths <- mapM (validatePackageJson . fromText) $ roPkgPaths opts
   outputPath <- validateOutput . fromText $ roOutputPath opts
   registries <- mapM validateUrl $ (roRegistries opts <>
                                     if roNoDefaultRegistry opts

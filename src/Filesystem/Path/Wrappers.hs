@@ -5,6 +5,7 @@ module Filesystem.Path.Wrappers where
 
 import ClassyPrelude hiding (FilePath, unpack)
 import qualified ClassyPrelude as CP
+import qualified Data.ByteString.Lazy.Char8 as BL8
 import Data.Text hiding (map)
 import System.Directory (Permissions(..))
 import qualified System.Directory as Dir

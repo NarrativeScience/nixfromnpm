@@ -7,7 +7,8 @@ module NixFromNpm.NpmTypes (
     PackageInfo(..), PackageMeta(..), VersionInfo(..),
     DistInfo(..), ResolvedPkg(..), DependencyType(..),
     BrokenPackageReason(..), ResolvedDependency(..),
-    Shasum(..)
+    Shasum(..), PackageJsonError(..),
+    packageJsonToVersionInfo
   ) where
 
 import qualified ClassyPrelude as CP
@@ -78,6 +79,14 @@ data DependencyType
   | DevDependency -- ^ Only required for development.
   deriving (Show, Eq)
 
+data PackageJsonError
+  = DirectoryDoesn'tExist FilePath
+  | NoPackageJson FilePath
+  | PackageJsonParseError ByteString String
+  deriving (Show, Eq, Typeable)
+
+instance Exception PackageJsonError
+
 -- | Reasons why an expression might not have been able to be built.
 data BrokenPackageReason
   = NoMatchingPackage Name
@@ -86,7 +95,7 @@ data BrokenPackageReason
   | NoSuchTag Name
   | TagPointsToInvalidVersion Name SemVer
   | InvalidSemVerSyntax Text String
-  | InvalidPackageJson Text String
+  | InvalidPackageJson PackageJsonError
   | NoDistributionInfo
   | Reason String
   | GithubError GithubError
@@ -175,9 +184,10 @@ instance FromJSON DistInfo where
     shasum <- SHA1 <$> o .: "shasum"
     return $ DistInfo tarball shasum
 
-patchIfMatches :: (a -> Bool) -- ^ Predicate function
-               -> (a -> a) -- ^ Modification function
-               -> a -- ^ Input object
-               -> a -- ^ Patched object
-patchIfMatches pred mod input | pred input = mod input
-                              | otherwise  = input
+packageJsonToVersionInfo :: MonadIO io => FilePath -> io VersionInfo
+packageJsonToVersionInfo path = do
+  putStrsLn ["Reading information from ", pathToText path]
+  pkJson <- readFile path
+  case eitherDecode $ fromStrict pkJson of
+    Left err -> throw $ PackageJsonParseError pkJson err
+    Right info -> return info

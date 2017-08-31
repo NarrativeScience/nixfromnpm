@@ -4,7 +4,11 @@
 {-# LANGUAGE RecordWildCards #-}
 {-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE FlexibleContexts #-}
-module NixFromNpm.ConvertToNix where
+module NixFromNpm.ConvertToNix (
+  module Nix.Types,
+  toDotNix, rootDefaultNix, defaultNixExtending,
+  packageJsonDefaultNix, resolvedPkgToNix, nodePackagesDir
+  ) where
 
 import qualified Prelude as P
 import qualified Data.HashMap.Strict as H
@@ -51,7 +55,7 @@ str = mkStr DoubleQuoted
 
 -- | Converts distinfo into a nix fetchurl call.
 distInfoToNix :: Maybe DistInfo -> NExpr
-distInfoToNix Nothing = mkPath "./."
+distInfoToNix Nothing = Nix.mkPath False "./."
 distInfoToNix (Just DistInfo{..}) = do
   let Success fetchurl = parseNixString "pkgs.fetchurl"
       (algo, hash) = case diShasum of
@@ -161,9 +165,17 @@ defaultNixExtending extName extensions = do
 
 -- | Create a `default.nix` file for a particular package.json; this simply
 -- imports the package as defined in the given path, and calls into it.
-mkPkgJsonDefaultNix :: FilePath -> NExpr
-mkPkgJsonDefaultNix path = do
-  mkFunction defaultParams $ importWith False path defaultInherits
+-- The resulting file looks as follows:
+-- {nodejsVersion ? "4.1", pkgs ? import <nixpkgs> {}}:
+-- let lib = import /output/path {inherit nodejsVersion pkgs;}; in
+-- lib.callPackage ./project.nix {};
+packageJsonDefaultNix :: FilePath -- ^ Output path where dependencies are
+                      -> NExpr
+packageJsonDefaultNix outputPath = do
+  mkFunction defaultParams $ do
+    mkLet ["lib" `bindTo` importWith False outputPath defaultInherits] $ do
+      let Success callPkg = parseNixString "lib.callPackage"
+      callPkg `mkApp` mkSym "./project.nix" `mkApp` mkNonRecSet []
 
 bindingsToMap :: [Binding t] -> Record t
 bindingsToMap = foldl' step mempty where

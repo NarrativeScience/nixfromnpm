@@ -31,15 +31,14 @@ import Nix.Types
 import Data.Digest.Pure.SHA (sha256, showDigest)
 
 import NixFromNpm.Common
+import NixFromNpm.GitTypes hiding (Tag)
 import NixFromNpm.NpmTypes
-import NixFromNpm.GitTypes as Git hiding (Tag)
-import NixFromNpm.SemVer
-import NixFromNpm.Parsers.Common hiding (Parser, Error, lines)
-import NixFromNpm.ConvertToNix (nixExprHasDevDeps)
-import NixFromNpm.Parsers.SemVer
 import NixFromNpm.NpmVersion
-import NixFromNpm.Parsers.NpmVersion
 import NixFromNpm.PackageMap
+import NixFromNpm.Parsers.Common hiding (Parser, Error, lines)
+import NixFromNpm.Parsers.NpmVersion
+import NixFromNpm.Parsers.SemVer
+import NixFromNpm.SemVer
 --------------------------------------------------------------------------
 
 -- | Things which can be converted into nix expressions: either they
@@ -188,6 +187,12 @@ addPackage name version pkg = do
     resolved = pmInsert name version pkg (resolved s)
     }
 
+rmPackage :: Name -> SemVer -> NpmFetcher ()
+rmPackage name version = do
+  modify $ \s -> s {
+    resolved = pmDelete name version (resolved s)
+    }
+
 -- | Get the hex sha256 of a bytestring.
 hexSha256 :: BL8.ByteString -> Shasum
 hexSha256 = SHA256 . pack . showDigest . sha256
@@ -202,9 +207,8 @@ _getPackageInfo pkgName registryUri = do
                 HttpErrorWithCode 404 -> throw (NoMatchingPackage pkgName)
                 err -> throw err
   case eitherDecode jsonStr of
-      Left err -> do
-        let text = decodeUtf8 $ BL8.toStrict jsonStr
-        throw $ InvalidPackageJson text err
+      Left err -> throw $ InvalidPackageJson
+                            (PackageJsonParseError (toStrict jsonStr) err)
       Right info -> return info
 
 -- | Same as _getPackageInfo, but caches results for speed.
@@ -285,7 +289,7 @@ prefetchSha256 uri = do
   -- Return the hash and the path.
   path <- liftIO $ do
     (path, handle) <- tempFile "nixfromnpmfetch.tgz"
-    BL8.hPut handle tarball
+    hPut handle tarball
     hClose handle
     putStrsLn ["Wrote tarball to ", pathToText path]
     return path
@@ -301,18 +305,9 @@ extractVersionInfo tarballPath subpath = do
              pathToText temp]
   shelly $ run_ "tar" ["-xf", pathToText tarballPath, "-C",
                        pathToText temp]
-  result <- extractPkgJson $ temp </> subpath </> "package.json"
+  result <- packageJsonToVersionInfo $ temp </> subpath </> "package.json"
   removeDirectoryRecursive temp
   return result
-
--- | Extract the version info out of a package.json file.
-extractPkgJson :: FilePath -> NpmFetcher VersionInfo
-extractPkgJson path = do
-  putStrsLn ["Reading information from ", pathToText path]
-  pkJson <- liftIO $ B.readFile (encodeString path)
-  case eitherDecode $ BL8.fromStrict pkJson of
-    Left err -> throw $ InvalidPackageJson (decodeUtf8 pkJson) err
-    Right info -> return info
 
 -- | Fetch a package over HTTP. Return the version of the fetched package,
 -- and store the hash.
@@ -560,36 +555,39 @@ currentDepth = map (\trace -> length trace - 1) $ gets packageStackTrace
 shouldFetchDevs :: NpmFetcher Bool
 shouldFetchDevs = (<) <$> currentDepth <*> asks nfsMaxDevDepth
 
--- | A VersionInfo is an abstraction of an NPM package. This will resolve
--- the version info into an actual package (recurring on the dependencies)
--- and add it to the resolved package map.
 resolveVersionInfo :: VersionInfo -> NpmFetcher SemVer
-resolveVersionInfo VersionInfo{..} = do
-  let recurOn' = recurOn viName viVersion
+resolveVersionInfo vInfo@(VersionInfo{..}) = do
   isBeingResolved viName viVersion >>= \case
     True -> do -- This is a cycle: allowed for dev dependencies, but we
                -- don't want to loop infinitely so we just return.
-               putStrLn "uh oh"
                return viVersion
-    False -> do
-      startResolving viName viVersion
-      deps <- recurOn' Dependency viDependencies
-      devDeps <- do
-        shouldFetch <- shouldFetchDevs
-        case shouldFetch || H.null viDevDependencies of
-          True -> Just <$> recurOn' DevDependency viDevDependencies
-          False -> return Nothing
-      finishResolving viName viVersion
-      -- Store this version's info.
-      addPackage viName viVersion $ NewPackage $ ResolvedPkg {
-          rpName = viName,
-          rpVersion = viVersion,
-          rpDistInfo = viDist,
-          rpMeta = viMeta,
-          rpDependencies = deps,
-          rpDevDependencies = devDeps
-        }
-      return viVersion
+    False -> do fst <$> resolveVersionInfoFull vInfo
+
+-- | A VersionInfo is an abstraction of an NPM package. This will resolve
+-- the version info into an actual package (recurring on the dependencies)
+-- and add it to the resolved package map.
+resolveVersionInfoFull :: VersionInfo -> NpmFetcher (SemVer, ResolvedPkg)
+resolveVersionInfoFull VersionInfo{..} = do
+  let recurOn' = recurOn viName viVersion
+  startResolving viName viVersion
+  deps <- recurOn' Dependency viDependencies
+  devDeps <- do
+    shouldFetch <- shouldFetchDevs
+    case shouldFetch || H.null viDevDependencies of
+      True -> Just <$> recurOn' DevDependency viDevDependencies
+      False -> return Nothing
+  finishResolving viName viVersion
+  let rPkg = ResolvedPkg {
+      rpName = viName,
+      rpVersion = viVersion,
+      rpDistInfo = viDist,
+      rpMeta = viMeta,
+      rpDependencies = deps,
+      rpDevDependencies = devDeps
+    }
+  -- Store this version's info.
+  addPackage viName viVersion $ NewPackage rPkg
+  return (viVersion, rPkg)
 
 -- | Resolves a dependency given a name and version range.
 _resolveDep :: Name -> SemVerRange -> NpmFetcher SemVer

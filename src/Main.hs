@@ -9,7 +9,7 @@ import Options.Applicative
 import NixFromNpm.Common hiding (getArgs, (<>))
 import NixFromNpm.Options (NixFromNpmOptions, parseOptions,
                            validateOptions)
-import NixFromNpm.Conversion (dumpPkgFromOptions)
+import NixFromNpm.Conversion (generateExpressions)
 
 main :: IO ()
 main = do
@@ -18,7 +18,7 @@ main = do
              (fullDesc <> progDesc description <> header headerText)
   parsedOpts <- execParser opts
   validatedOpts <- validateOptions parsedOpts
-  dumpPkgFromOptions validatedOpts
+  generateExpressions validatedOpts
   where
     description = concat ["nixfromnpm allows you to generate nix expressions ",
                           "automatically from npm packages. It provides ",

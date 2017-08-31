@@ -25,7 +25,7 @@ import Nix.Pretty (prettyNix)
 import NixFromNpm.ConvertToNix (toDotNix,
                                 rootDefaultNix,
                                 defaultNixExtending,
-                                mkPkgJsonDefaultNix,
+                                packageJsonDefaultNix,
                                 resolvedPkgToNix,
                                 nodePackagesDir)
 import NixFromNpm.Options
@@ -37,21 +37,14 @@ import NixFromNpm.NpmLookup (FullyDefinedPackage(..),
                              NpmFetcher(..),
                              NpmFetcherSettings(..),
                              NpmFetcherState(..),
-                             addPackage,
+                             addPackage, rmPackage,
                              toFullyDefined,
                              startState,
                              runNpmFetchWith,
                              resolveNpmVersionRange,
-                             resolveVersionInfo,
-                             extractPkgJson,
+                             resolveVersionInfoFull,
                              defaultSettings,
                              PreExistingPackage(..))
-
-data ConversionError
-  = NoPackagesGenerated
-  | FolderDoesNotExist FilePath
-  | FileDoesNotExist FilePath
-  deriving (Show, Eq, Typeable)
 
 -- | The npm lookup utilities will produce a bunch of fully defined packages.
 -- However, the only packages that we want to write are the new ones; that
@@ -143,7 +136,7 @@ initializeOutput = do
   withDir outputPath $ do
     putStrsLn ["Initializing  ", pathToText outputPath]
     version <- case fromHaskellVersion Paths_nixfromnpm.version of
-      Left err -> fatal err
+      Left err -> fatal ("When parsing version: " <> err)
       Right v -> return v
     writeFile ".nixfromnpm-version" $ renderSV version
     case H.keys extensions of
@@ -157,6 +150,7 @@ initializeOutput = do
       (extName:_) -> do -- Then we are extending things.
         writeNix "default.nix" $ defaultNixExtending extName extensions
 
+-- | Convenience function to write a nix expression to the given path.
 writeNix :: MonadIO io => FilePath -> NExpr -> io ()
 writeNix path = writeFile path . show . prettyNix
 
@@ -165,12 +159,11 @@ writeNix path = writeFile path . show . prettyNix
 writeNewPackages :: NpmFetcher ()
 writeNewPackages = takeNewPackages <$> gets resolved >>= \case
   newPackages
-    | H.null newPackages -> putStrLn "No new packages created."
+    | H.null newPackages -> putStrLn "No library packages created."
     | otherwise -> do
       outputPath <- asks nfsOutputPath
       let path = outputPath </> nodePackagesDir
       putStrsLn ["Creating new packages at ", pathToText path]
-      createDirectoryIfMissing path
       withDir path $ do
         -- Write the .nix file for each version of this package.
         forM_ (H.toList newPackages) $ \(pkgName, pkgVers) -> do
@@ -193,34 +186,41 @@ writeNewPackages = takeNewPackages <$> gets resolved >>= \case
             allVersions <- catMaybes . map convert <$> getDirectoryContents "."
             createSymbolicLink (toDotNix $ maximum allVersions) "latest.nix"
 
-dumpFromPkgJson :: FilePath -- ^ Path to folder containing package.json.
-                -> NpmFetcher ()
-dumpFromPkgJson path = do
-  doesDirectoryExist path >>= \case
-    False -> errorC ["No such directory ", pathToText path]
-    True -> withDir path $ do
-      doesFileExist "package.json" >>= \case
-        False -> errorC ["No package.json found in ", pathToText path]
-        True -> do
-          verinfo <- extractPkgJson "package.json"
-          let (name, version) = (viName verinfo, viVersion verinfo)
-          putStrsLn ["Generating expression for package ", name,
-                     ", version ", renderSV version]
-          resolveVersionInfo verinfo
-          basePath <- pmLookup name version <$> gets resolved >>= \case
-            Nothing -> errorC ["FATAL: could not build nix file"]
-            Just (FromExistingInOutput _) -> asks nfsOutputPath
-            Just (NewPackage _) -> asks nfsOutputPath
-            Just (FromExistingInExtension extName _) -> do
-              extendPaths <- asks nfsExtendPaths
-              return (extendPaths H.! extName)
-          defNixPath <- map (</> "default.nix") getCurrentDirectory
-          putStrsLn ["Writing package nix file at ", pathToText defNixPath]
-          let fullPath = basePath </> fromText name </> toDotNix version
-          writeNix "default.nix" $ mkPkgJsonDefaultNix fullPath
+-- | Load all of the expressions from a package.json's dependencies,
+-- including dev dependencies. Generate nix files for that package.
+convertPackageJson :: FilePath
+                   -- ^ Path to folder containing package.json.
+                   -> VersionInfo -- ^ Parsed VersionInfo.
+                   -> NpmFetcher ()
+convertPackageJson path verinfo = do
+  let (name, version) = (viName verinfo, viVersion verinfo)
+  putStrsLn ["Generating expression for package ", name,
+             ", version ", renderSV version]
+  -- "Pretend" that we've never loaded this file up, even if
+  -- we have. This will force the generated file to be a new
+  -- package.
+  storedResolved <- gets resolved
+  -- storedResolved might contain this package.
+  modify $ \s -> s {resolved = pmDelete name version (resolved s)}
+  -- now our state definitely does not. Resolve the version info.
+  rPkg <- snd <$> resolveVersionInfoFull verinfo
+  case pmLookup name version storedResolved of
+    -- If we had a previous version, restore it here.
+    Just existing -> addPackage name version existing
+    -- Otherwise, remove the one we just created because we
+    -- don't want to write it to the package store.
+    Nothing -> rmPackage name version
+  withDir path $ do
+    outputPath <- asks nfsOutputPath
+    putStrsLn ["Writing package nix files at ", pathToText path]
+    writeNix "project.nix" $ resolvedPkgToNix rPkg
+    writeNix "default.nix" $ packageJsonDefaultNix outputPath
 
-dumpPkgFromOptions :: NixFromNpmOptions -> IO ()
-dumpPkgFromOptions (opts@NixFromNpmOptions{..}) = do
+-- | Top-level entry point for generating expressions from the
+-- command-line. Fetches all given packages and dependencies of
+-- package.json files, and writes them to disk.
+generateExpressions :: NixFromNpmOptions -> IO ()
+generateExpressions (opts@NixFromNpmOptions{..}) = do
   let settings = defaultSettings {
     nfsGithubAuthToken = nfnoGithubToken,
     nfsRegistries = nfnoRegistries,
@@ -234,12 +234,11 @@ dumpPkgFromOptions (opts@NixFromNpmOptions{..}) = do
     preloadPackages
     initializeOutput
     forM nfnoPkgNames $ \(name, range) -> do
-      resolveNpmVersionRange name range
+      (resolveNpmVersionRange name range >> return ())
         `catch` \(e :: SomeException) -> do
-          putStrsLn ["Failed to build ", name, "@", pshow range, ": ", pshow e]
-          return (0, 0, 0, [])
+          warns ["Failed to build ", name, "@", pshow range, ": ", pshow e]
       writeNewPackages
-    forM nfnoPkgPaths $ \path -> do
-      dumpFromPkgJson path
+    forM nfnoPkgPaths $ \(path, verInfo) -> do
+      convertPackageJson path verInfo
       writeNewPackages
   return ()
